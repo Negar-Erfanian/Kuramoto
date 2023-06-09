@@ -17,32 +17,44 @@ sns.reset_orig()
 
 class NeuralODE(nn.Module):  # Here I will solve using the solver
     act_fn: Callable
+    actfn: Callable
+    #dropout: Callable
     node_size: int
     normal: str
     hdims : str
 
     @nn.compact
-    def __call__(self, ts, y):
-        if not self.normal:
-            kernels = self.param('kernel', nn.initializers.normal(), [self.node_size, self.node_size, self.node_size])
-        else:
+    def __call__(self, ts, ys):
+        y, args = ys
+        if self.hdims!=None:
             hdims_list = [int(i) for i in self.hdims.split('-')]
-            kernels = []
-            first_dim = self.node_size
+        else:
+            hdims_list = []
+        kernels = []
+        first_dim = self.node_size
+        if not self.normal:
+            for i, dim in enumerate(hdims_list):
+                kernels.append(self.param(f'kernel{i}', nn.initializers.normal(), [dim, self.node_size, first_dim]))
+                first_dim = dim
+            kernels.append(self.param('kernel', nn.initializers.normal(), [self.node_size, self.node_size, first_dim]))
+        else:
             for i, dim in enumerate(hdims_list):
                 kernels.append(self.param(f'kernel{i}', nn.initializers.normal(), [first_dim, dim]))
                 first_dim = dim
             kernels.append(self.param('kernel', nn.initializers.normal(), [first_dim, self.node_size]))
         def fn(t, y, args):
-            y0, bias, data_adj = y
-
+            y0 = y
+            bias, data_adj = args
             if not self.normal:
-                if len(y0.shape) == 1:
-                    y0 = jnp.expand_dims(jnp.expand_dims(y0, 0), -1)
-                elif len(y0.shape) == 2:
+                if len(y0.shape) == 2:
                     y0 = jnp.expand_dims(y0, -1)
-                y0 = jnp.einsum('ijk,lmj->ilm', y0, kernels)
+                elif len(y0.shape) == 1:
+                    y0 = jnp.expand_dims(jnp.expand_dims(y0, -1), 0)
+                for kernel in kernels:
+                    y0 = jnp.einsum('ijk,lmj->ilm', y0, kernel)
                 y0 = self.act_fn(y0)
+                #y0 = self.dropout(y0)
+
                 if y0.shape[0] == 1:
                     y0 = jnp.squeeze(y0, 0)
                 if len(y0.shape) == 2:
@@ -62,7 +74,7 @@ class NeuralODE(nn.Module):  # Here I will solve using the solver
                 elif len(data_adj.shape) == 3:
                     y1 = jnp.einsum('ik,ijk->ik', y0, data_adj)
                     out = self.act_fn(y1) + jnp.squeeze(bias, -1)
-            return out, bias, data_adj
+            return out#, bias, data_adj
 
         solution = diffrax.diffeqsolve(
             diffrax.ODETerm(fn),
@@ -71,14 +83,14 @@ class NeuralODE(nn.Module):  # Here I will solve using the solver
             t1=ts[-1],
             dt0=0.01,  # ts[1] - ts[0],
             y0=y,
+            args=args,
             stepsize_controller=diffrax.PIDController(rtol=1e-3, atol=1e-6, dtmax=0.1),
             saveat=diffrax.SaveAt(ts=ts),
             made_jump=True,
 
         )
-
-        return solution.ys[
-            0]  # jax.lax.reshape(solution.ys[0], (solution.ys[0].shape[1], solution.ys[0].shape[0], solution.ys[0].shape[-1]))
+        #print(f'what is the shape of solution? {solution.ys[0].shape} and {solution.ys[1].shape} and {solution.ys[2].shape} and {len(solution.ys)}')
+        return solution.ys  # jax.lax.reshape(solution.ys[0], (solution.ys[0].shape[1], solution.ys[0].shape[0], solution.ys[0].shape[-1]))
     ##############################
 
 class Sigmoid(nn.Module):

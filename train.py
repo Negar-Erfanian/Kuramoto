@@ -1,4 +1,4 @@
-import os
+import matplotlib.pyplot as plt
 
 from utils import *
 from model.neuralODE import *
@@ -32,17 +32,24 @@ batch_size = args.batch_size
 normal = args.normal
 lr = args.lr
 weight_decay = args.weight_decay
-ratios = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1]
+train = args.train
+losstype = args.losstype
+
+ratios = list(np.linspace(0.01,1,100))
 
 
 act_fn = act_fn_by_name['sine']()
+actfn = act_fn_by_name['relu']()
 
 os.environ['CUDA_VISIBLE_DEVICES'] = f"{gpu_num}"
 
 path = os.getcwd()
 CHECKPOINT_PATH = f"{path}/saved_models/kuramoto_jax_{normal}normal"\
-                  + f"{num_epochs}epochs_" \
-                  + f"{act_fn}_actfn_" + f"{hdims}hdims"
+                  + f"{num_epochs}epochs_" +\
+                  f"{batch_size}batchsize_" +\
+                  f"{node_size}nodesize_" \
+                  + f"{act_fn}actfn_" + f"{hdims}hdims_" + f"{losstype}loss"
+#CHECKPOINT_PATH = f"{path}/saved_models/test"
 os.makedirs(CHECKPOINT_PATH, exist_ok=True)
 
 def loader():
@@ -55,8 +62,8 @@ def loader():
     eval_data = (ys[train_size:], bias[train_size:], data_adj[train_size:])
     train_loader = dataloader(train_data, batch_size=batch_size, key=loader_key)
     eval_loader = dataloader(eval_data, batch_size=batch_size, key=loader_key)
-    inp = (ys[:,0],bias, data_adj)
-    return train_loader, eval_loader ,model_key, ts, inp
+    inp = (ys[:,0], (bias, data_adj))
+    return train_loader, eval_loader ,model_key, ts, inp, mat
 
 def train_ode(model_name,
               model_class,  # NeuralODE
@@ -69,28 +76,29 @@ def train_ode(model_name,
               train_loader,
               eval_loader,
               num_epochs,
-              path):
+              path,
+              train,
+              losstype):
     # Create a trainer module with specified hyperparameters
     trainer = TrainerModule(model_name, model_class, model_hparams, optimizer_name, optimizer_hparams, ts, inp,
-                            model_key, path)
-    trainer.train_model(train_loader = train_loader, eval_loader = eval_loader, ts=ts, num_epochs=num_epochs, ratios = ratios)
-    if trainer.checkpoint_exists():  # continue training if pretrained model exists
+                            model_key, path, losstype)
+    if train:
+        trainer.train_model(train_loader = train_loader, eval_loader = eval_loader, ts=ts, num_epochs=num_epochs, ratios = ratios)
+    else:  # continue training if pretrained model exists
         trainer.load_model()
 
-    else:
-        trainer.load_model(pretrained=True)
     # Test trained model
     val_loss = trainer.eval_model(ts, eval_loader)
     return trainer, {'val': val_loss}
 
-def train(path = CHECKPOINT_PATH):
-    train_loader, eval_loader ,model_key, ts, inp = loader()
+def trainmodel(path = CHECKPOINT_PATH):
+    train_loader, eval_loader ,model_key, ts, inp, mat = loader()
     print(f'path is {CHECKPOINT_PATH}')
     if model_class == 'NeuralODE':
         model = NeuralODE
     trainer, val_loss = train_ode(model_name="nODE",
                                   model_class=model,  # NeuralODE
-                                  model_hparams={"node_size": node_size, "act_fn": act_fn, "normal" : normal, "hdims": hdims},
+                                  model_hparams={"node_size": node_size, "act_fn": act_fn, "normal" : normal, "hdims": hdims, "actfn": actfn},
                                   optimizer_name=optimizer_name,
                                   optimizer_hparams={"lr": lr, "weight_decay": weight_decay},
                                   inp= inp,
@@ -99,10 +107,52 @@ def train(path = CHECKPOINT_PATH):
                                   train_loader = train_loader,
                                   eval_loader = eval_loader,
                                   num_epochs=num_epochs,
-                                  path = path)
-
+                                  path = path,
+                                  train = train,
+                                  losstype = losstype)
+    if not train:
+        idx = 0
+        parameters = jax.tree_util.tree_leaves(trainer.state.params)
+        print('The learned kernels have the following shapes:', ', '.join([str(p.shape) for p in parameters]))
+        print('Overall number of parameters:', sum([np.prod(p.shape) for p in parameters]))
+        print(jax.tree_map(lambda p: p.shape, trainer.state.params))
+        visualization(train_loader, trainer, ts, idx, loader_name = "train")
+        visualization(eval_loader, trainer, ts, idx, loader_name = "eval")
+        if hdims==None:
+            weight_viz(trainer, mat)
     return trainer, val_loss
 
 
+def visualization(loader, trainer, ts, idx, loader_name):
+    ys, b, adj = next(iter(loader))
+    params = trainer.state.params
+    batch = (ys[:, 0], (b, adj))
+    y_pred = jax.vmap(trainer.state.apply_fn, in_axes=(None, None, 0))(params, ts, batch)
+    fig, axes = plt.subplots(2, 2, figsize=(10, 8))
+    axes[0, 0].plot(jnp.sin(ys[idx]))
+    axes[0, 0].set_title('Real data Sine')
+    axes[0, 1].plot(ys[idx])
+    axes[0, 1].set_title('Real data phase')
+    axes[1, 0].plot(jnp.sin(y_pred[idx]))
+    axes[1, 0].set_title('Predicted data Sine')
+    axes[1, 1].plot(y_pred[idx])
+    axes[1, 1].set_title('Predicted data phase')
+    plt.tight_layout()
+    plt.savefig(f'{CHECKPOINT_PATH}/Kuramoto-{loader_name}.png')
+    plt.show()
+
+def weight_viz(trainer, mat):
+    fig, axes = plt.subplots(1, 3, figsize=(10, 8))
+    axes[0].imshow(trainer.state.params['params']['kernel'][0])
+    axes[0].set_title('Learned weights')
+    axes[1].imshow(mat[0][0])
+    axes[1].set_title('True weights')
+    axes[2].imshow(jnp.abs(mat[0][0] - trainer.state.params['params']['kernel'][0]))
+    axes[2].set_title('difference')
+    plt.tight_layout()
+    plt.savefig(f'{CHECKPOINT_PATH}/Kuramoto_weights.png')
+    plt.show()
+
+
 if __name__ == '__main__':
-    train()
+    trainer, val_loss = trainmodel()

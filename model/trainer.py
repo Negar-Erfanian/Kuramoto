@@ -39,7 +39,8 @@ class TrainerModule:
                  ts: Any,
                  exmp_imgs: Any,  # (ys[:,0],bias, data_adj)
                  model_key : int,
-                 path : str):
+                 path : str,
+                 losstype : str):
         """
         Module for summarizing all training functionalities for classification on CIFAR10.
 
@@ -65,6 +66,7 @@ class TrainerModule:
         self.log_dir = os.path.join(path, self.model_name)
         self.logger = SummaryWriter(log_dir=self.log_dir)
         self.path = path
+        self.losstype = losstype
         # Create jitted training and eval functions
         self.create_functions()
         # Initialize model
@@ -74,12 +76,15 @@ class TrainerModule:
     def create_functions(self):
         # Function to calculate the classification loss and accuracy for a model
         def calculate_loss_acc(state, params, ts, batch):
-            y, bias, adj = batch
-            batch = (y[:, 0], bias, adj)
+            y, args = batch
+            batch = (y[:, 0], args)
             # Obtain the logits and predictions of the model for the input data
 
             y_pred = jax.vmap(state.apply_fn, in_axes=(None, None, 0))(params, ts, batch)
-            loss = jnp.mean((y - y_pred) ** 2)
+            if self.losstype=="sin":
+                loss = jnp.mean((jnp.sin(y) - jnp.sin(y_pred)) ** 2)
+            elif self.losstype == "criterion":
+                loss = jnp.mean((y - y_pred) ** 2)
             return loss
 
         # Training function
@@ -182,9 +187,10 @@ class TrainerModule:
         metrics = defaultdict(list)
         for batch in tqdm(train_loader, desc='Training', leave=False):
             y, b, adj = batch
+            args = (b, adj)
             ti = ts[:int(time_length * ratio)]
             yi = y[:, :int(time_length * ratio)]
-            self.state, loss = self.train_step(self.state, ti, (yi, b, adj))
+            self.state, loss = self.train_step(self.state, ti, (yi, args))
             metrics['loss'].append(loss)
         for key in metrics:
             avg_val = np.stack(jax.device_get(metrics[key])).mean()
@@ -195,7 +201,8 @@ class TrainerModule:
         # Test model on all images of a data loader and return avg loss
         loss_val, count = 0, 0
         for batch in data_loader:
-            loss = self.eval_step(self.state, ts, batch)
+            y,b, adj = batch
+            loss = self.eval_step(self.state, ts, (y, (b, adj)))
             loss_val += loss * batch[0].shape[0]
             count += batch[0].shape[0]
         eval_loss = (loss_val / count).item()
