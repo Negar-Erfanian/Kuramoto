@@ -1,6 +1,6 @@
 
-from flax.training import checkpoints
-
+#from flax.training import checkpoints
+import json
 import jax
 import jax.numpy as jnp
 import flax.linen as nn
@@ -12,6 +12,7 @@ jax.config.update("jax_enable_x64", True)
 import os
 from typing import Any
 from collections import defaultdict
+import equinox as eqx
 
 ## Imports for plotting
 import matplotlib
@@ -36,8 +37,6 @@ class TrainerModule:
                  model_hparams: dict,  # {node_size = node_size, act_fn  = act_fn_by_name['sine']()}
                  optimizer_name: str,
                  optimizer_hparams: dict,
-                 ts: Any,
-                 exmp_imgs: Any,  # (ys[:,0],bias, data_adj)
                  model_key : int,
                  path : str,
                  losstype : str):
@@ -61,7 +60,7 @@ class TrainerModule:
         self.optimizer_hparams = optimizer_hparams
         self.model_key = model_key
         # Create empty model. Note: no parameters yet
-        self.model = self.model_class(**self.model_hparams)
+        self.model = self.model_class(**self.model_hparams, key = model_key)
         # Prepare logging
         self.log_dir = os.path.join(path, self.model_name)
         self.logger = SummaryWriter(log_dir=self.log_dir)
@@ -70,53 +69,51 @@ class TrainerModule:
         # Create jitted training and eval functions
         self.create_functions()
         # Initialize model
-        self.init_model(ts, exmp_imgs)
 
 
     def create_functions(self):
         # Function to calculate the classification loss and accuracy for a model
-        def calculate_loss_acc(state, params, ts, batch):
+        @eqx.filter_value_and_grad
+        def calculate_loss_acc(model, ts, batch):
             y, args = batch
             batch = (y[:, 0], args)
-            # Obtain the logits and predictions of the model for the input data
-
-            y_pred = jax.vmap(state.apply_fn, in_axes=(None, None, 0))(params, ts, batch)
+            y_pred = jax.vmap(model, in_axes=(None, 0))(ts, batch)
             if self.losstype=="sin":
+                loss = jnp.mean((jnp.sin(y) - jnp.sin(y_pred)) ** 2)
+            elif self.losstype == "criterion":
+                loss = jnp.mean((y - y_pred) ** 2)
+                print(f'y_pred shape is {y_pred.shape}')
+            return loss
+
+        # Training function
+        # Jit the function for efficiency
+        @eqx.filter_jit
+        def train_step(ts, batch, model, opt_state):
+            loss, grads = calculate_loss_acc(model, ts, batch)
+            print(f'grads are {grads}')
+            updates, opt_state = self.optimizer.update(grads, opt_state)
+            print(f'opt_state is {opt_state}')
+            model = eqx.apply_updates(model, updates)
+            return loss, model, opt_state
+
+
+        # Eval function
+        # Jit the function for efficiency
+        @eqx.filter_jit
+        def eval_step(ts, batch, model):
+            # Determine the accuracy
+            y, args = batch
+            batch = (y[:, 0], args)
+            y_pred = jax.vmap(model, in_axes=(None, 0))(ts, batch)
+            if self.losstype == "sin":
                 loss = jnp.mean((jnp.sin(y) - jnp.sin(y_pred)) ** 2)
             elif self.losstype == "criterion":
                 loss = jnp.mean((y - y_pred) ** 2)
             return loss
 
-        # Training function
-        # Jit the function for efficiency
-        def train_step(state, ts, batch):
-            # Gradient function
-            grad_fn = jax.value_and_grad(calculate_loss_acc,  # Function to calculate the loss
-                                         argnums=1,  # Parameters are second argument of the function
-                                         has_aux=False  # Function has additional outputs, here accuracy
-                                         )
-            # Determine gradients for current model, parameters and batch
-            loss, grads = grad_fn(state, state.params, ts, batch)
-            # Perform parameter update with gradients and optimizer
-            state = state.apply_gradients(grads=grads)
-            # Return state and any other value we might want
-            return state, loss
+        self.train_step = train_step
+        self.eval_step = eval_step
 
-        # Eval function
-        # Jit the function for efficiency
-        def eval_step(state, ts, batch):
-            # Determine the accuracy
-            loss = calculate_loss_acc(state, state.params, ts, batch)
-            return loss
-
-        self.train_step = jax.jit(train_step)
-        self.eval_step = jax.jit(eval_step)
-
-    def init_model(self, ts, exmp_imgs):
-        # Initialize model
-        variables = self.model.init(self.model_key, ts, exmp_imgs)
-        self.init_params = variables
-        self.state = None
 
     def init_optimizer(self, num_epochs, num_steps_per_epoch):
         # Initialize learning rate schedule and optimizer
@@ -124,6 +121,8 @@ class TrainerModule:
             opt_class = optax.adam
         elif self.optimizer_name.lower() == 'adamw':
             opt_class = optax.adamw
+        elif self.optimizer_name.lower() == 'adablf':
+            opt_class = optax.adabelief
         elif self.optimizer_name.lower() == 'sgd':
             opt_class = optax.sgd
         else:
@@ -132,22 +131,24 @@ class TrainerModule:
         lr_schedule = optax.piecewise_constant_schedule(
             init_value=self.optimizer_hparams.pop('lr'),
             boundaries_and_scales=
-            {int(num_steps_per_epoch * num_epochs * 0.6): 0.1,
-             int(num_steps_per_epoch * num_epochs * 0.85): 0.1}
+            {int(num_steps_per_epoch * num_epochs * 0.6): 0.05,
+             int(num_steps_per_epoch * num_epochs * 0.85): 0.01}
         )
         # Clip gradients at max value, and evt. apply weight decay
         transf = [optax.clip(1.0)]
         if opt_class == optax.sgd and 'weight_decay' in self.optimizer_hparams:  # wd is integrated in adamw
             transf.append(optax.add_decayed_weights(self.optimizer_hparams.pop('weight_decay')))
-        optimizer = optax.chain(
+        self.optimizer = optax.chain(
             *transf,
             opt_class(lr_schedule, **self.optimizer_hparams)
         )
+        #self.optimizer = opt_class(self.optimizer_hparams.pop('lr'))
 
         # Initialize training state
-        self.state = train_state.TrainState.create(apply_fn=self.model.apply,
-                                                   params=self.init_params if self.state is None else self.state.params,
-                                                   tx=optimizer)
+        #print(f'self.optimizer is {self.optimizer}')
+        print(f' model is {eqx.filter(self.model, eqx.is_inexact_array)}')
+        self.opt_state = self.optimizer.init(eqx.filter(self.model, eqx.is_inexact_array))
+        print(f'self.opt_state is {self.opt_state}')
 
     def train_model(self, train_loader, eval_loader, ts, num_epochs=100,
                     ratios=[0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1]):
@@ -175,7 +176,11 @@ class TrainerModule:
                     eval_loss = self.eval_model(ts, eval_loader)
                     print(f'train_loss is {loss}, eval loss is {eval_loss} and epoch is {epoch_idx}')
                     self.logger.add_scalar('val/loss', eval_loss, global_step=epoch_idx)
-                    self.save_model(step=1, epoch=epoch_idx, ratio=ratio)
+                    hyperparams = {'epoch': epoch_idx,
+                                   'ratio': ratio}
+                    self.save_model(os.path.join(self.path,
+                                                 f'{self.model_name}.ckpt'),
+                                    hyperparams)
                     if eval_loss <= best_eval:
                         best_eval = eval_loss
 
@@ -190,7 +195,7 @@ class TrainerModule:
             args = (b, adj)
             ti = ts[:int(time_length * ratio)]
             yi = y[:, :int(time_length * ratio)]
-            self.state, loss = self.train_step(self.state, ti, (yi, args))
+            loss, self.model, self.opt_state = self.train_step(ti, (yi, args), self.model, self.opt_state)
             metrics['loss'].append(loss)
         for key in metrics:
             avg_val = np.stack(jax.device_get(metrics[key])).mean()
@@ -200,35 +205,29 @@ class TrainerModule:
     def eval_model(self, ts, data_loader):
         # Test model on all images of a data loader and return avg loss
         loss_val, count = 0, 0
+        inference_model = eqx.tree_inference(self.model, value=True)
         for batch in data_loader:
-            y,b, adj = batch
-            loss = self.eval_step(self.state, ts, (y, (b, adj)))
+            y, b, adj = batch
+            loss = self.eval_step(ts, (y, (b, adj)), inference_model)
             loss_val += loss * batch[0].shape[0]
             count += batch[0].shape[0]
         eval_loss = (loss_val / count).item()
         return eval_loss
 
-    def save_model(self, step, epoch, ratio):
-        # Save current model at certain training iteration
-        checkpoints.save_checkpoint(ckpt_dir=os.path.join(self.path, f'{self.model_name}.ckpt'),
-                                    target={'params': self.state.params,
-                                            'epoch': epoch,
-                                            'ratio': ratio},
-                                    step=step,
-                                    prefix='my_model',
-                                    overwrite=True)
+    def save_model(self, filename, hyperparams): #hyperparams = step, epoch, ratio
+        with open(filename, "wb") as f:
+            hyperparam_str = json.dumps(hyperparams)
+            f.write((hyperparam_str + "\n").encode())
+            eqx.tree_serialise_leaves(f, self.model)
 
     def load_model(self):
-        # Load model. We use different checkpoint for pretrained models
-        state_dict = checkpoints.restore_checkpoint(ckpt_dir=os.path.join(self.path, f'{self.model_name}.ckpt'),
-                                                    prefix='my_model',
-                                                    target=None)
-        self.state = train_state.TrainState.create(apply_fn=self.model.apply,
-                                                   params=state_dict['params'],
-                                                   tx=self.state.tx if self.state else optax.sgd(0.1)
-                                                   # Default optimizer
-                                                   )
-        return state_dict['epoch'], state_dict['ratio']
+        print(f'wer are here to draw')
+        with open(os.path.join(self.path, f'{self.model_name}.ckpt'), "rb") as f:
+            hyperparams = json.loads(f.readline().decode())
+            model = self.model_class(**self.model_hparams, key = self.model_key)
+            self.model = eqx.tree_deserialise_leaves(f, model)
+        return hyperparams['epoch'], hyperparams['ratio']
+
 
     def checkpoint_exists(self):
         # Check whether a pretrained model exist for this autoencoder

@@ -16,7 +16,7 @@ import seaborn as sns
 sns.set()
 sns.reset_orig()
 
-class NeuralODE(eqx.Module):  # Here I will solve using the solver
+class NeuralODEgnn(eqx.Module):  # Here I will solve using the solver
     node_size: int
     hdims: str
     normal: bool
@@ -28,7 +28,7 @@ class NeuralODE(eqx.Module):  # Here I will solve using the solver
 
 
     def __init__(self, node_size, hdims, normal, dropoutrate, *, key, **kwargs):
-        super(NeuralODE).__init__(**kwargs)
+        super(NeuralODEgnn).__init__(**kwargs)
         self.dropout= eqx.nn.Dropout(p=dropoutrate)
         self.node_size = node_size
         self.hdims = hdims
@@ -40,13 +40,15 @@ class NeuralODE(eqx.Module):  # Here I will solve using the solver
         self.kernels_init(key1)
 
 
+
+
     def kernels_init(self, key):
         if self.hdims != None:
             hdims_list = [int(i) for i in self.hdims.split('-')]
         else:
             hdims_list = []
         kernels = []
-        first_dim = 1 #self.node_size
+        first_dim = self.node_size
         keys = jrandom.split(key, len(hdims_list)+1)
         if not self.normal:
             for i, dim in enumerate(hdims_list):
@@ -62,9 +64,9 @@ class NeuralODE(eqx.Module):  # Here I will solve using the solver
 
     def __call__(self, ts, ys):
         y0, args = ys
+        print(f'shapes are {y0.shape}, bias is {args[0].shape} and adj is {args[1].shape}')
         def fn(t, y, args):
             y0 = y
-
             bias, data_adj = args
             if not self.normal:
                 if len(y0.shape) == 2:
@@ -97,6 +99,7 @@ class NeuralODE(eqx.Module):  # Here I will solve using the solver
                     y1 = jnp.einsum('ik,ijk->ik', y0, data_adj)
                     out = self.act_fn(y1) + jnp.squeeze(bias, -1)'''
                 out = jnp.squeeze(out, -1) + jnp.squeeze(bias, -1)
+            print(f'out shape is{out.shape}')
             return out
 
 
@@ -111,7 +114,6 @@ class NeuralODE(eqx.Module):  # Here I will solve using the solver
             stepsize_controller=diffrax.PIDController(rtol=1e-3, atol=1e-6, dtmax=0.1),
             saveat=diffrax.SaveAt(ts=ts),
             made_jump=True,
-
         )
         # print(f'what is the shape of solution? {solution.ys[0].shape} and {solution.ys[1].shape} and {solution.ys[2].shape} and {len(solution.ys)}')
         return solution.ys
@@ -130,9 +132,10 @@ if __name__ == '__main__':
     key = jrandom.PRNGKey(0)
     model_hparams = {"node_size": node_size,
                      "normal": False,
-                     "hdims": None
+                     "hdims": None,
+                     "dropoutrate": 0.1,
                      }
-    model = NeuralODE(**model_hparams, key = key)
+    model = NeuralODEgnn(**model_hparams, key = key)
     y_pred = jax.vmap(model, in_axes=(None, 0))(ts, (x[:, 0], args))
     print(f'model is {model}')
     print(f'y_pred is {y_pred.shape}')

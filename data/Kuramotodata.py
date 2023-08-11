@@ -19,7 +19,7 @@ sns.reset_orig()
 
 class KuramotoDataset():
 
-    def __init__(self, dataset_size, node_num, seed, weight_params=(0, 0.1), bias_params=(1, 0.1), prob=0.1, t0=0, t1=4,
+    def __init__(self, dataset_size, node_num, seed, datatype, weight_params=(0, 0.1), bias_params=(1, 0.1), prob=0.1, t0=0, t1=4,
                  tt=500):
         """
         Inputs:
@@ -34,10 +34,16 @@ class KuramotoDataset():
         self.node_num = node_num
         self.seed = seed
         self.key = jrandom.PRNGKey(seed)
+        self.datatype = datatype
         self.t = (t0, t1, tt)
 
-    def weighted_graph(self):
-        np.random.seed(self.seed)
+    def weighted_graph(self, key):
+        #print(f'shape is {jrandom.uniform(key, shape = (self.node_num, self.node_num))}')
+        arr = jrandom.uniform(key, shape = (self.node_num, self.node_num))
+        weights = jrandom.normal(key, shape = (self.node_num, self.node_num))*self.weight_params[1] + self.weight_params[0]
+        arr = jnp.matmul(jnp.array(arr>=self.prob, int), weights)
+        '''print(f'{arr.shape}')
+        #np.random.seed(self.seed)
         G = nx.Graph()  # Create a graph object called G
         node_list = [i for i in range(self.node_num)]
         edge_list = []
@@ -58,14 +64,14 @@ class KuramotoDataset():
         for w, edge in enumerate(edge_list):
             G.add_edge(edge[0], edge[1], weight=weights[w])
 
-        data_adj = jnp.array(nx.adjacency_matrix(G).todense())
-        return data_adj
+        data_adj = jnp.array(nx.adjacency_matrix(G).todense())'''
+        return arr
 
     def _get_data(self, ts, key):
         theta = jrandom.normal(key, shape=(self.node_num, 1)) * 2 * jnp.pi  # initial phase \theta between 0 and \pi
         bias = jrandom.normal(key, shape=(self.node_num, 1)) * self.bias_params[1] + self.bias_params[
             0]  # initial inherent frequency \w chosen from a gaussian distribution
-        data_adj = self.weighted_graph()
+        data_adj = self.weighted_graph(key)
         mat = jnp.zeros((self.node_num, self.node_num,
                          self.node_num))  # wight matrix that couplutes the phase difference when multiplied by \theta
         for i in range(mat.shape[0]):
@@ -88,13 +94,28 @@ class KuramotoDataset():
 
             return out
 
-        solver = diffrax.Dopri5()
-        dt0 = 0.01
-        saveat = diffrax.SaveAt(ts=ts)
-        sol = diffrax.diffeqsolve(
-            diffrax.ODETerm(f), solver, ts[0], ts[-1], dt0, theta, saveat=saveat,
-            stepsize_controller=PIDController(rtol=1e-3, atol=1e-6, dtmax=0.1))
-        ys = sol.ys
+        if self.datatype == "deterministic":
+            solver = diffrax.Dopri5()
+            dt0 = 0.01
+            saveat = diffrax.SaveAt(ts=ts)
+            sol = diffrax.diffeqsolve(
+                diffrax.ODETerm(f), solver, ts[0], ts[-1], dt0, theta, saveat=saveat,
+                stepsize_controller=PIDController(rtol=1e-3, atol=1e-6, dtmax=0.1))
+            ys = sol.ys
+        elif self.datatype == "stochastic":
+            diffusion = lambda t, y, args: 0.05 * t
+            brownian_motion = VirtualBrownianTree(ts[0], ts[-1], tol=1e-5, shape=(), key=jrandom.PRNGKey(0))
+            terms = MultiTerm(ODETerm(f), ControlTerm(diffusion, brownian_motion))
+            solver = diffrax.Dopri5()
+            dt0 = 0.01
+            saveat = diffrax.SaveAt(ts=ts)
+            sol = diffrax.diffeqsolve(terms, solver, ts[0], ts[-1], dt0, theta,
+                                      saveat=saveat,
+                                      stepsize_controller=PIDController(rtol=1e-5,
+                                                                        atol=1e-5,
+                                                                        dtmax=0.1,
+                                                                        error_order=0.5))
+            ys = sol.ys
         return ys, theta, bias, data_adj, mat
 
     def get_data(self):
@@ -113,5 +134,5 @@ class KuramotoDataset():
         return data_point[idx], theta[idx], bias[idx], data_adj[idx]
 
 if __name__ == '__main__':
-    dataclass = KuramotoDataset(dataset_size = 32, node_num = 100, seed = 100, weight_params=(0, 0.1), bias_params=(1, 0.1), prob=0.1, t0=0, t1=4, tt=500)
+    dataclass = KuramotoDataset(dataset_size = 32, node_num = 100, seed = 100, type = "deterministic", weight_params=(0, 0.1), bias_params=(1, 0.1), prob=0.1, t0=0, t1=4, tt=500)
     ts, ys, theta, bias, data_adj, mat = dataclass.get_data()
